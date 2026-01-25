@@ -48,6 +48,7 @@ class OLSSignalTrader:
                     q      = q_decile,
                     labels = [i + 1 for i in range(q_decile)]).shift()))
             
+            display
             
     
     def single_signal_ols_run(
