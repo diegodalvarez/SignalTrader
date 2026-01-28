@@ -93,59 +93,95 @@ class DecileTrader:
     def _optimize_deciles_matched_sharpe_sign(
         self, 
         df_decile  : pd.DataFrame,
-        q          : int,
-        signal_name: str, 
         lower_level: int = 2,
         upper_level: int = 9) -> pd.DataFrame: 
-        
-        keep_cols = [
-            i for i in range(1, q + 1) if i <= lower_level or i >= upper_level]
-        
-        df_tmp = (df_decile
-                .query("decile == @keep_cols")
-                .assign(tmp_name = lambda x: np.where(x.decile <= lower_level, "lower_group", "upper_group")))
-        
-        df_opt = (df_tmp[
-            ["tmp_name", "sharpe"]]
-            .groupby("tmp_name")
-            .agg("prod")
-            .assign(signal = lambda x: np.where(x.sharpe > 0, 1, 0))
-            .reset_index()
-            .drop(columns = ["sharpe"]))
-        
-        df_tmp_signal = (df_tmp
-                .merge(right = df_opt, how = "inner", on = ["tmp_name"])
-                [["decile", "group", signal_name, "signal", "sharpe"]]
-                .rename(columns = {"signal": "tmp_signal"})
-                .assign(signal = lambda x: np.sign(x.sharpe) * x.tmp_signal)
-                .drop(columns = ["tmp_signal"]))
-        
-        df_middle = (df_decile
-                .query("decile != @keep_cols")
-                .assign(signal = 0))
-        
-        df_out = pd.concat([df_tmp_signal, df_middle])
+    
+        middle_part = [i for i in range(lower_level + 1, upper_level)]
+    
+        df_middle = (df_decile.query(
+            "decile == @middle_part").
+            assign(signal = lambda x: 0))
+    
+        df_decile_tmp = (df_decile.query(
+            "decile != @middle_part").
+            assign(decile = lambda x: x.decile.astype(int)).
+            assign(decile_tmp = lambda x: np.where(x.decile <= lower_level, "lower_group", "upper_group")))
+    
+        df_group_scaler = (df_decile_tmp[
+            ["decile_tmp", "sharpe"]].
+            groupby("decile_tmp").
+            agg("prod").
+            assign(tmp = lambda x: np.where(x.sharpe > 0, 1, 0))
+            [["tmp"]].
+            reset_index())
+    
+        df_decile_outer = (df_decile_tmp.merge(
+            right = df_group_scaler, how = "inner", on = ["decile_tmp"]).
+            assign(signal = lambda x: x.tmp * x.sharpe).
+            drop(columns = ["decile_tmp", "tmp"]))
+    
+        df_out = (pd.concat([
+            df_middle, df_decile_outer]).
+            sort_values("decile"))
+    
         return df_out
+    
+    def _optimize_deciles_matched_sharpe_sign(
+        self, 
+        df_decile  : pd.DataFrame,
+        lower_level: int = 2,
+        upper_level: int = 9) -> pd.DataFrame: 
+    
+        middle_part = [i for i in range(lower_level + 1, upper_level)]
+    
+        df_middle = (df_decile.query(
+            "decile == @middle_part").
+            assign(signal = lambda x: 0))
+    
+        df_decile_tmp = (df_decile.query(
+            "decile != @middle_part").
+            assign(decile = lambda x: x.decile.astype(int)).
+            assign(decile_tmp = lambda x: np.where(x.decile <= lower_level, "lower_group", "upper_group")))
+    
+        df_group_scaler = (df_decile_tmp[
+            ["decile_tmp", "sharpe"]].
+            groupby("decile_tmp").
+            agg("prod").
+            assign(tmp = lambda x: np.where(x.sharpe > 0, 1, 0))
+            [["tmp"]].
+            reset_index())
+    
+        df_decile_outer = (df_decile_tmp.merge(
+            right = df_group_scaler, how = "inner", on = ["decile_tmp"]).
+            assign(signal = lambda x: x.tmp * x.sharpe).
+            drop(columns = ["decile_tmp", "tmp"]))
+    
+        df_out = (pd.concat([
+            df_middle, df_decile_outer]).
+            sort_values("decile"))
+    
+        return df_out
+    
+    def get_decile_backtest(
+            self,
+            df: pd.DataFrame) -> pd.DataFrame: 
         
-    def optimize_deciles_matched_sharpe_sign(
-        self,
-        df_decile       : pd.DataFrame,
-        signal_name     : str, 
-        q               : int, 
-        lower_level     : int = 2,
-        upper_level     : int = 9) -> pd.DataFrame: 
+        df_decile_sharpe = (df.query(
+            "group == 'in_sample'")
+            [["decile", "signal_name", "sharpe"]].
+            drop_duplicates())
         
-        df_opt = (df_decile
-                [["decile", "group", signal_name, "sharpe"]]
-                .drop_duplicates()
-                .groupby(["group", signal_name])
-                .apply(self._optimize_deciles_matched_sharpe_sign, q, signal_name, lower_level, upper_level)
-                .drop(columns = [signal_name, "group"])
-                .reset_index()
-                .drop(columns = ["level_2"]))
+        df_opt_signal = (df_decile_sharpe.groupby(
+            "signal_name").
+            apply(self._optimize_deciles_matched_sharpe_sign).
+            reset_index(drop = True).
+            drop(columns = ["sharpe"]))
         
-        display(df_opt)
-        return-1
+        df_out = (df.merge(
+            right = df_opt_signal, how = "inner", on = ["decile", "signal_name"]).
+            assign(signal_rtn = lambda x: np.sign(x.signal) * x.spx_rtn))
+        
+        return df_out
         
         
 file     = "tmp.parquet"
@@ -155,14 +191,13 @@ df_input = (pd.read_parquet(
 df_input = (df_input.assign(
     signal1 = lambda x: x.vix_diff.ewm(span = 10, adjust = False).mean(),
     siganl2 = lambda x: x.vix_diff.ewm(span = 100, adjust = False).mean()).
-    head(500).
     reset_index().
     drop(columns = ["SPY", "VIX", "vix_diff"]).
     melt(id_vars = ["date", "spx_rtn"], var_name = "signal_name", value_name = "signal_val").
     set_index("date"))
 
-#df_decile_sharpe = DecileTrader().setup_deciles(df_input, "signal_name", "signal_val", "spx_rtn")
-#df_decile_sharpe.to_parquet("decile_sharpe.parquet")
+df_decile_sharpe = DecileTrader().setup_deciles(df_input, "signal_name", "signal_val", "spx_rtn")
 
-df_decile_sharpe = pd.read_parquet(path = "decile_sharpe.parquet")
-DecileTrader().optimize_deciles_matched_sharpe_sign(df_decile_sharpe, "signal_name", 10)
+df_decile_ts = pd.read_parquet("decile_ts.parquet")
+df_ts        = DecileTrader().get_decile_backtest(df_decile_ts)
+df_ts.to_parquet(path = "signal_rtn.parquet")
