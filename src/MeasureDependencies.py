@@ -22,7 +22,7 @@ class Dependence:
         
         mi = (mutual_info_regression(
             X            = df[features],
-            y            = df[[target]],
+            y            = df[[target]].values,
             random_state = self.random_state))
         
         df_mi = (pd
@@ -72,3 +72,28 @@ class Dependence:
             .merge(right = df_dcor   , how = "inner", on = ["features"]))
         
         return df_compare
+    
+import os
+if __name__ == "__main__":
+    
+    src_path  = os.getcwd()
+    repo_path = os.path.abspath(os.path.join(src_path, ".."))
+    data_path = os.path.join(repo_path, "data", "tmp.parquet")
+    
+    df_tmp = (pd
+            .read_parquet(path = data_path, engine = "pyarrow")
+            [["SPY"]]
+            .diff()
+            .assign(
+                ten_ma      = lambda x: x.SPY.ewm(span = 10, adjust = False).mean().shift(),
+                thirty_ma   = lambda x: x.SPY.ewm(span = 30, adjust = False).mean().shift(),
+                one_hundred = lambda x: x.SPY.ewm(span = 100, adjust = False).mean().shift())
+            .dropna())
+    
+    target   = "SPY"
+    features = list(set(df_tmp.columns.to_list()) - set(["SPY"]))
+    
+    dependency    = Dependence()
+    df_dependency = dependency.measure_dependency(df_tmp, target, features)
+    
+    display(df_dependency)
