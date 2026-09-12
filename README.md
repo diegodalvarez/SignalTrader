@@ -1,2 +1,2 @@
-# OLSSignalTrader
-Toolkit for developing strategies using OLS
+# Signal Trader
+Toolkit for testing signals
