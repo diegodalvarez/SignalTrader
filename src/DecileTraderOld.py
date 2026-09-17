@@ -72,17 +72,21 @@ class DecileTrader:
                 .reset_index()
                 .dropna())
         
+        print("flag1")
+        
         df_os = (df
                 .groupby(signal_name)
                 .apply(self._get_out_of_sample_decile, q, start_size)
                 .drop(columns = [signal_name])
                 .reset_index())
         
+        print("flag2")
+        
         df_decile = pd.concat([df_is, df_os])
         
         df_out = (df_decile
                   [["decile", "group", signal_name, rtn_name]]
-                  .groupby(["decile", "group", "signal_name"])
+                  .groupby(["decile", "group", signal_name])
                   .agg(lambda x: x.mean() / x.std() * np.sqrt(252))
                   .reset_index()
                   .rename(columns = {rtn_name: "sharpe"})
@@ -183,21 +187,24 @@ class DecileTrader:
         
         return df_out
         
+def main() -> None:
         
-file     = "tmp.parquet"
-df_input = (pd.read_parquet(
-    path  = file, engine = "pyarrow"))
-
-df_input = (df_input.assign(
-    signal1 = lambda x: x.vix_diff.ewm(span = 10, adjust = False).mean(),
-    siganl2 = lambda x: x.vix_diff.ewm(span = 100, adjust = False).mean()).
-    reset_index().
-    drop(columns = ["SPY", "VIX", "vix_diff"]).
-    melt(id_vars = ["date", "spx_rtn"], var_name = "signal_name", value_name = "signal_val").
-    set_index("date"))
-
-df_decile_sharpe = DecileTrader().setup_deciles(df_input, "signal_name", "signal_val", "spx_rtn")
-
-df_decile_ts = pd.read_parquet("decile_ts.parquet")
-df_ts        = DecileTrader().get_decile_backtest(df_decile_ts)
-df_ts.to_parquet(path = "signal_rtn.parquet")
+    file     = "tmp.parquet"
+    df_input = (pd.read_parquet(
+        path  = file, engine = "pyarrow"))
+    
+    df_input = (df_input.assign(
+        signal1 = lambda x: x.vix_diff.ewm(span = 10, adjust = False).mean(),
+        siganl2 = lambda x: x.vix_diff.ewm(span = 100, adjust = False).mean()).
+        reset_index().
+        drop(columns = ["SPY", "VIX", "vix_diff"]).
+        melt(id_vars = ["date", "spx_rtn"], var_name = "signal_name", value_name = "signal_val").
+        set_index("date"))
+    
+    df_decile_sharpe = DecileTrader().setup_deciles(df_input, "signal_name", "signal_val", "spx_rtn")
+    
+    df_decile_ts = pd.read_parquet("decile_ts.parquet")
+    df_ts        = DecileTrader().get_decile_backtest(df_decile_ts)
+    df_ts.to_parquet(path = "signal_rtn.parquet")
+    
+if __name__ == "__main__": main()
