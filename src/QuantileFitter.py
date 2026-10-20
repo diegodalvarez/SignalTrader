@@ -5,13 +5,16 @@ Created on Fri Oct 16 10:49:00 2026
 @author: Diego
 
 Pure computation module for quantile (decile) conditioning of a signal.
-Sorts the signal into n_bins buckets per ticker, measures the Sharpe of
+Sorts the signal into n_bins buckets per group, measures the Sharpe of
 returns in each bucket, and keeps the n_outer buckets on each side depending
 on a Sharpe threshold and a group scaler. Nothing in here reads or writes to
 disk
 
 Expected input is a long DataFrame with columns
-    date | ticker | <signal_col> | <rtn_col>
+    <date_col> | <group_col> | <signal_col> | <rtn_col>
+
+date_col defaults to date and group_col defaults to ticker, both are passed
+through to SignalFitter. signal_col is passed to each fit, like SignalFitter
 
 Positions are -1 / 0 / +1 per bucket, middle buckets are always 0. The
 strategy return is signal_rtn = position * raw rtn_col, the final portfolio
@@ -30,10 +33,14 @@ class QuantileFitter(SignalFitter):
 
     def __init__(
             self,
-            signal_col: str = "signal",
-            rtn_col   : str = "px_rtn") -> None:
+            rtn_col  : str = "px_rtn",
+            group_col: str = "ticker",
+            date_col : str = "date") -> None:
 
-        super().__init__(signal_col = signal_col, rtn_col = rtn_col)
+        super().__init__(
+            rtn_col    = rtn_col,
+            group_col  = group_col,
+            date_col   = date_col)
 
         self.ann_factor = np.sqrt(252)
         self.scalers    = {
@@ -89,7 +96,7 @@ class QuantileFitter(SignalFitter):
     def _bins_full(self, signal: pd.Series, n_bins: int) -> np.ndarray:
 
         '''
-        In-sample buckets, edges come from the ticker's full history
+        In-sample buckets, edges come from the group's full history
         '''
 
         values = signal.to_numpy(dtype = float)
@@ -112,15 +119,15 @@ class QuantileFitter(SignalFitter):
             n_bins: int) -> pd.DataFrame:
 
         '''
-        Sharpe per ticker per bin, every bin 1..n_bins shows up even if empty
+        Sharpe per group per bin, every bin 1..n_bins shows up even if empty
         '''
 
         full_index = pd.MultiIndex.from_product(
-            [df.ticker.drop_duplicates().sort_values(), np.arange(1, n_bins + 1)],
-            names = ["ticker", "bin"])
+            [df[self.group_col].drop_duplicates().sort_values(), np.arange(1, n_bins + 1)],
+            names = [self.group_col, "bin"])
 
         df_out = (df
-            .groupby(["ticker", "bin"])
+            .groupby([self.group_col, "bin"])
             [y_col]
             .agg(["mean", "std", "count"])
             .reindex(full_index)
@@ -182,7 +189,7 @@ class QuantileFitter(SignalFitter):
 
         '''
         sharpe is (n_rows, n_bins) and positions come back the same shape,
-        rows can be tickers (in-sample / train) or dates (expanding)
+        rows can be groups (in-sample / train) or dates (expanding)
         '''
 
         scaler_func = self.scalers[scaler]
@@ -201,7 +208,7 @@ class QuantileFitter(SignalFitter):
             sharpe_threshold: float,
             scaler          : str) -> pd.DataFrame:
 
-        df_wide   = df_sharpe.pivot(index = "ticker", columns = "bin", values = "sharpe")
+        df_wide   = df_sharpe.pivot(index = self.group_col, columns = "bin", values = "sharpe")
         positions = self._get_positions(df_wide.to_numpy(dtype = float), n_outer, sharpe_threshold, scaler)
 
         df_out = (pd.DataFrame(
@@ -209,25 +216,26 @@ class QuantileFitter(SignalFitter):
             index   = df_wide.index,
             columns = df_wide.columns).
             reset_index().
-            melt(id_vars = "ticker", value_name = "position"))
+            melt(id_vars = self.group_col, value_name = "position"))
 
         return df_out
 
     def _prep_quantile(
             self,
             df        : pd.DataFrame,
+            signal_col: str,
             lag       : Union[int, Dict[str, int]],
             vol_target: bool,
             vol_window: int,
             vol_lag   : int) -> Tuple[pd.DataFrame, str]:
 
         '''
-        Lags the signal within ticker (so the bucket label is lagged) and
+        Lags the signal within group (so the bucket label is lagged) and
         optionally vol normalizes the returns used for the Sharpes. The raw
         rtn_col is kept for the strategy return
         '''
 
-        return self._prep_data(df, lag, vol_target, vol_window, vol_lag)
+        return self._prep_data(df, signal_col, lag, vol_target, vol_window, vol_lag)
 
     def _group_label(self, bins: pd.Series, n_bins: int, n_outer: int) -> np.ndarray:
 
@@ -238,6 +246,7 @@ class QuantileFitter(SignalFitter):
     def fit_quantile_full_sample(
             self,
             df              : pd.DataFrame,
+            signal_col      : str,
             n_bins          : int   = 10,
             n_outer         : int   = 2,
             sharpe_threshold: float = 0.0,
@@ -249,18 +258,18 @@ class QuantileFitter(SignalFitter):
 
         '''
         In-sample quantile conditioning, bucket edges, Sharpes and positions
-        all come from each ticker's full history
+        all come from each group's full history
 
         Returns {"sharpe", "positions", "data", "y_col", "config"}
         '''
 
         self._check_config(n_bins, n_outer, scaler)
-        df_prep, y_col = self._prep_quantile(df, lag, vol_target, vol_window, vol_lag)
+        df_prep, y_col = self._prep_quantile(df, signal_col, lag, vol_target, vol_window, vol_lag)
 
         df_binned = (df_prep.assign(
             bin = lambda x: (x
-                .groupby("ticker")
-                [self.signal_col]
+                .groupby(self.group_col)
+                [signal_col]
                 .transform(lambda s: self._bins_full(s, n_bins))
                 .astype(int))))
 
@@ -268,7 +277,7 @@ class QuantileFitter(SignalFitter):
         df_positions = self._positions_table(df_sharpe, n_bins, n_outer, sharpe_threshold, scaler)
 
         df_data = (df_binned
-            .merge(right = df_positions, how = "left", on = ["ticker", "bin"])
+            .merge(right = df_positions, how = "left", on = [self.group_col, "bin"])
             .assign(signal_rtn = lambda x: x.position * x[self.rtn_col]))
 
         out_dict = {
@@ -277,6 +286,7 @@ class QuantileFitter(SignalFitter):
             "data"     : df_data,
             "y_col"    : y_col,
             "config"   : {
+                "signal_col"      : signal_col,
                 "n_bins"          : n_bins,
                 "n_outer"         : n_outer,
                 "sharpe_threshold": sharpe_threshold,
@@ -287,7 +297,7 @@ class QuantileFitter(SignalFitter):
     def get_quantile_params(self, fit_dict: dict) -> pd.DataFrame:
 
         '''
-        One row per ticker per bin with Sharpe, nobs, position, group and
+        One row per group per bin with Sharpe, nobs, position, group and
         whether that group was switched on
         '''
 
@@ -295,15 +305,15 @@ class QuantileFitter(SignalFitter):
         n_outer = fit_dict["config"]["n_outer"]
 
         df_out = (fit_dict["sharpe"]
-            .merge(right = fit_dict["positions"], how = "inner", on = ["ticker", "bin"])
+            .merge(right = fit_dict["positions"], how = "inner", on = [self.group_col, "bin"])
             .assign(group = lambda x: self._group_label(x.bin, n_bins, n_outer))
             .assign(group_active = lambda x: (x
                 .assign(tmp = lambda y: y.position != 0)
-                .groupby(["ticker", "group"])
+                .groupby([self.group_col, "group"])
                 .tmp
                 .transform("any")
                 .where(x.group != "middle", False)))
-            [["ticker", "bin", "group", "mean", "std", "nobs", "sharpe", "position", "group_active"]])
+            [[self.group_col, "bin", "group", "mean", "std", "nobs", "sharpe", "position", "group_active"]])
 
         return df_out
 
@@ -311,6 +321,7 @@ class QuantileFitter(SignalFitter):
             self,
             df_train        : pd.DataFrame,
             df_test         : pd.DataFrame,
+            signal_col      : str,
             y_col           : str,
             n_bins          : int,
             n_outer         : int,
@@ -319,13 +330,13 @@ class QuantileFitter(SignalFitter):
 
         '''
         Edges, Sharpes and positions come from train only, then are applied
-        unchanged to test. Both frames are a single ticker with a date index
+        unchanged to test. Both frames are a single group with a date index
         '''
 
-        edges = self._get_bin_edges(df_train[self.signal_col].to_numpy(dtype = float), n_bins)
+        edges = self._get_bin_edges(df_train[signal_col].to_numpy(dtype = float), n_bins)
 
-        df_train_out = df_train.assign(bin = lambda x: self._apply_bin_edges(x[self.signal_col].to_numpy(dtype = float), edges))
-        df_test_out  = df_test.assign(bin = lambda x: self._apply_bin_edges(x[self.signal_col].to_numpy(dtype = float), edges))
+        df_train_out = df_train.assign(bin = lambda x: self._apply_bin_edges(x[signal_col].to_numpy(dtype = float), edges))
+        df_test_out  = df_test.assign(bin = lambda x: self._apply_bin_edges(x[signal_col].to_numpy(dtype = float), edges))
 
         df_sharpe    = self._bin_sharpe(df_train_out, y_col, n_bins)
         df_positions = self._positions_table(df_sharpe, n_bins, n_outer, sharpe_threshold, scaler)
@@ -352,6 +363,7 @@ class QuantileFitter(SignalFitter):
     def fit_quantile_train_test_ratio(
             self,
             df              : pd.DataFrame,
+            signal_col      : str,
             train_ratio     : float = 0.7,
             n_bins          : int   = 10,
             n_outer         : int   = 2,
@@ -363,8 +375,8 @@ class QuantileFitter(SignalFitter):
             vol_lag         : int   = 1) -> dict:
 
         '''
-        Train / test split by ratio respecting time order, each ticker is cut
-        at its own ratio. Returns {ticker: {"edges", "sharpe", "positions",
+        Train / test split by ratio respecting time order, each group is cut
+        at its own ratio. Returns {group: {"edges", "sharpe", "positions",
         "train", "test", "y_col"}}
         '''
 
@@ -372,20 +384,20 @@ class QuantileFitter(SignalFitter):
             raise ValueError("train_ratio must be between 0 and 1")
 
         self._check_config(n_bins, n_outer, scaler)
-        df_prep, y_col = self._prep_quantile(df, lag, vol_target, vol_window, vol_lag)
+        df_prep, y_col = self._prep_quantile(df, signal_col, lag, vol_target, vol_window, vol_lag)
         tts_dict       = {}
         skipped        = []
 
-        for ticker, df_tmp in df_prep.groupby("ticker"):
+        for group, df_tmp in df_prep.groupby(self.group_col):
 
-            split = self._split_ratio(df_tmp.set_index("date"), train_ratio, n_bins)
+            split = self._split_ratio(df_tmp.set_index(self.date_col), train_ratio, n_bins)
 
             if split is None:
-                skipped.append(ticker)
+                skipped.append(group)
                 continue
 
-            tts_dict[ticker] = self._fit_quantile_split(
-                split[0], split[1], y_col, n_bins, n_outer, sharpe_threshold, scaler)
+            tts_dict[group] = self._fit_quantile_split(
+                split[0], split[1], signal_col, y_col, n_bins, n_outer, sharpe_threshold, scaler)
 
         if len(skipped) > 0:
             warnings.warn("Skipped (too few train / test obs): {}".format(skipped), UserWarning, stacklevel = 2)
@@ -395,6 +407,7 @@ class QuantileFitter(SignalFitter):
     def fit_quantile_train_test_date(
             self,
             df              : pd.DataFrame,
+            signal_col      : str,
             cutoff_date     : Union[str, pd.Timestamp],
             n_bins          : int   = 10,
             n_outer         : int   = 2,
@@ -406,26 +419,26 @@ class QuantileFitter(SignalFitter):
             vol_lag         : int   = 1) -> dict:
 
         '''
-        Train / test split on a common date for every ticker
+        Train / test split on a common date for every group
         train: date <= cutoff_date, test: date > cutoff_date
         '''
 
         self._check_config(n_bins, n_outer, scaler)
         cutoff         = pd.Timestamp(cutoff_date)
-        df_prep, y_col = self._prep_quantile(df, lag, vol_target, vol_window, vol_lag)
+        df_prep, y_col = self._prep_quantile(df, signal_col, lag, vol_target, vol_window, vol_lag)
         tts_dict       = {}
         skipped        = []
 
-        for ticker, df_tmp in df_prep.groupby("ticker"):
+        for group, df_tmp in df_prep.groupby(self.group_col):
 
-            split = self._split_date(df_tmp.set_index("date"), cutoff, n_bins)
+            split = self._split_date(df_tmp.set_index(self.date_col), cutoff, n_bins)
 
             if split is None:
-                skipped.append(ticker)
+                skipped.append(group)
                 continue
 
-            tts_dict[ticker] = self._fit_quantile_split(
-                split[0], split[1], y_col, n_bins, n_outer, sharpe_threshold, scaler)
+            tts_dict[group] = self._fit_quantile_split(
+                split[0], split[1], signal_col, y_col, n_bins, n_outer, sharpe_threshold, scaler)
 
         if len(skipped) > 0:
             warnings.warn("Skipped (too few train / test obs): {}".format(skipped), UserWarning, stacklevel = 2)
@@ -435,14 +448,14 @@ class QuantileFitter(SignalFitter):
     def get_quantile_train_test_stats(self, tts_dict: dict) -> pd.DataFrame:
 
         '''
-        In-sample vs out-of-sample stats of signal_rtn per ticker. Hit rate is
+        In-sample vs out-of-sample stats of signal_rtn per group. Hit rate is
         measured on days with a position only
         '''
 
         df_lists = []
-        for ticker, tts in tts_dict.items():
+        for group, tts in tts_dict.items():
 
-            stats = {"ticker": ticker}
+            stats = {self.group_col: group}
             for name in ["train", "test"]:
 
                 df_tmp     = tts[name]
@@ -460,7 +473,7 @@ class QuantileFitter(SignalFitter):
 
         df_out = (pd.DataFrame(
             df_lists)
-            [["ticker", "train_sharpe", "test_sharpe", "train_hit_rate", "test_hit_rate",
+            [[self.group_col, "train_sharpe", "test_sharpe", "train_hit_rate", "test_hit_rate",
               "train_pct_active", "test_pct_active", "train_nobs", "test_nobs",
               "train_end", "test_start"]])
 
@@ -504,6 +517,7 @@ class QuantileFitter(SignalFitter):
     def fit_quantile_expanding(
             self,
             df              : pd.DataFrame,
+            signal_col      : str,
             n_bins          : int   = 10,
             n_outer         : int   = 2,
             sharpe_threshold: float = 0.0,
@@ -515,7 +529,7 @@ class QuantileFitter(SignalFitter):
             min_obs         : int   = 2) -> dict:
 
         '''
-        Expanding out-of-sample quantile conditioning per ticker
+        Expanding out-of-sample quantile conditioning per group
         1. bucket: signal ranked against its own history (lagged by lag)
         2. running Sharpe of every bucket through t-1
         3. positions from the scaler on those running Sharpes
@@ -523,26 +537,26 @@ class QuantileFitter(SignalFitter):
         min_obs is the number of returns a bucket needs before it can take a
         position (2 is the minimum to have a std)
 
-        Returns {ticker: DataFrame indexed by date}
+        Returns {group: DataFrame indexed by date_col}
         '''
 
         self._check_config(n_bins, n_outer, scaler)
-        df_prep, y_col = self._prep_quantile(df, lag, vol_target, vol_window, vol_lag)
+        df_prep, y_col = self._prep_quantile(df, signal_col, lag, vol_target, vol_window, vol_lag)
         sharpe_cols    = ["sharpe_{}".format(i) for i in range(1, n_bins + 1)]
         exp_dict       = {}
 
-        for ticker, df_tmp in df_prep.groupby("ticker"):
+        for group, df_tmp in df_prep.groupby(self.group_col):
 
-            df_tmp = df_tmp.set_index("date").sort_index()
-            bins   = self._bins_expanding(df_tmp[self.signal_col], n_bins)
+            df_tmp = df_tmp.set_index(self.date_col).sort_index()
+            bins   = self._bins_expanding(df_tmp[signal_col], n_bins)
             y      = df_tmp[y_col].to_numpy(dtype = float)
 
             sharpe    = self._expanding_bin_sharpe(y, bins, n_bins, min_obs)
             positions = self._get_positions(sharpe, n_outer, sharpe_threshold, scaler)
             position  = positions[np.arange(len(bins)), bins - 1]
 
-            exp_dict[ticker] = (df_tmp
-                [[self.signal_col, self.rtn_col, y_col]]
+            exp_dict[group] = (df_tmp
+                [[signal_col, self.rtn_col, y_col]]
                 .assign(
                     bin        = bins,
                     position   = position,
@@ -594,7 +608,7 @@ def _check(name: str, condition: bool) -> bool:
 def main() -> None:
 
     df      = _simulate_quantile_data()
-    fitter  = QuantileFitter(signal_col = "signal", rtn_col = "px_rtn")
+    fitter  = QuantileFitter(rtn_col = "px_rtn")
     results = []
     trend   = "tick0_comdty"
     revert  = "tick3_comdty"
@@ -603,7 +617,7 @@ def main() -> None:
 
     # 1. full sample: trend tails long top / short bottom, middle flat
     start     = time.time()
-    fit_dict  = fitter.fit_quantile_full_sample(df, lag = 0)
+    fit_dict  = fitter.fit_quantile_full_sample(df, "signal", lag = 0)
     df_params = fitter.get_quantile_params(fit_dict)
     full_time = time.time() - start
 
@@ -617,7 +631,7 @@ def main() -> None:
     results.append(_check("Full sample: middle bins always 0",
         (df_params.loc[lambda x: x.group == "middle"].position == 0).all()))
     results.append(_check("Full sample: middle bin rows kept (not dropped)",
-        len(fit_dict["data"]) == len(fitter._prep_data(df, 0, True, 100, 1)[0])))
+        len(fit_dict["data"]) == len(fitter._prep_data(df, "signal", 0, True, 100, 1)[0])))
 
     # 2. bins match pd.qcut
     df_tmp  = fit_dict["data"].loc[lambda x: x.ticker == trend]
@@ -625,14 +639,14 @@ def main() -> None:
     results.append(_check("Full sample bins match pd.qcut", (qcut.values == df_tmp.bin.values).all()))
 
     # 3. lag = 1 lags the bucket within ticker
-    fit_lag = fitter.fit_quantile_full_sample(df, lag = 1, vol_target = False)
-    fit_raw = fitter.fit_quantile_full_sample(df, lag = 0, vol_target = False)
+    fit_lag = fitter.fit_quantile_full_sample(df, "signal", lag = 1, vol_target = False)
+    fit_raw = fitter.fit_quantile_full_sample(df, "signal", lag = 0, vol_target = False)
     n_lag   = fit_lag["data"].groupby("ticker").size()
     n_none  = fit_raw["data"].groupby("ticker").size()
     results.append(_check("lag = 1 drops exactly one row per ticker", ((n_none - n_lag) == 1).all()))
 
     # 4. threshold zeroes everything when set very high
-    fit_high = fitter.fit_quantile_full_sample(df, lag = 0, sharpe_threshold = 50)
+    fit_high = fitter.fit_quantile_full_sample(df, "signal", lag = 0, sharpe_threshold = 50)
     results.append(_check("Huge |Sharpe| threshold zeroes all positions", (fit_high["positions"].position == 0).all()))
 
     # 5. scaler unit tests on crafted Sharpes (n_outer = 3)
@@ -653,9 +667,9 @@ def main() -> None:
 
     # 6. train / test: nothing from test leaks into the fit
     cutoff   = "2006-12-29"
-    tts_date = fitter.fit_quantile_train_test_date(df, cutoff_date = cutoff)
+    tts_date = fitter.fit_quantile_train_test_date(df, "signal", cutoff_date = cutoff)
     df_shock = df.assign(px_rtn = lambda x: np.where(x.date > pd.Timestamp(cutoff), -x.px_rtn * 50, x.px_rtn))
-    tts_shck = fitter.fit_quantile_train_test_date(df_shock, cutoff_date = cutoff)
+    tts_shck = fitter.fit_quantile_train_test_date(df_shock, "signal", cutoff_date = cutoff)
 
     leak_ok = all(
         np.allclose(tts_date[t]["edges"], tts_shck[t]["edges"]) and
@@ -669,7 +683,7 @@ def main() -> None:
         for tts in tts_date.values())
     results.append(_check("Date split: edges are train quantiles", edges_ok))
 
-    tts_ratio = fitter.fit_quantile_train_test_ratio(df, train_ratio = 0.7, scaler = "mean")
+    tts_ratio = fitter.fit_quantile_train_test_ratio(df, "signal", train_ratio = 0.7, scaler = "mean")
     ratio_ok  = all(tts["train"].index.max() < tts["test"].index.min() for tts in tts_ratio.values())
     results.append(_check("Ratio split: time ordered", ratio_ok))
 
@@ -679,7 +693,7 @@ def main() -> None:
 
     # 7. expanding: running Sharpe and bins match brute force
     start    = time.time()
-    exp_dict = fitter.fit_quantile_expanding(df, lag = 0)
+    exp_dict = fitter.fit_quantile_expanding(df, "signal", lag = 0)
     exp_time = time.time() - start
 
     df_exp   = exp_dict[trend]
@@ -703,7 +717,7 @@ def main() -> None:
     df_fut   = df.copy()
     late     = df_fut.groupby("ticker").cumcount() > k
     df_fut.loc[late, ["signal", "px_rtn"]] = df_fut.loc[late, ["signal", "px_rtn"]] * -3
-    exp_fut  = fitter.fit_quantile_expanding(df_fut, lag = 0)
+    exp_fut  = fitter.fit_quantile_expanding(df_fut, "signal", lag = 0)
 
     first_changed = df_fut.loc[late].groupby("ticker").date.min()
     future_ok     = all(
@@ -714,6 +728,28 @@ def main() -> None:
 
     results.append(_check("Expanding: past positions unaffected by future data", future_ok))
     results.append(_check("Expanding: trend ticker positive Sharpe", fitter._sharpe(df_exp.signal_rtn) > 0))
+
+    # 9. custom group_col / date_col pass through and match the defaults
+    df_alt     = df.rename(columns = {"ticker": "signal_name", "date": "Date"})
+    fitter_alt = QuantileFitter(rtn_col = "px_rtn", group_col = "signal_name", date_col = "Date")
+
+    df_params_alt = fitter_alt.get_quantile_params(fitter_alt.fit_quantile_full_sample(df_alt, "signal", lag = 0))
+    df_stats_alt  = fitter_alt.get_quantile_train_test_stats(fitter_alt.fit_quantile_train_test_ratio(df_alt, "signal", train_ratio = 0.7, scaler = "mean"))
+    tts_date_alt  = fitter_alt.fit_quantile_train_test_date(df_alt, "signal", cutoff_date = cutoff)
+    exp_alt       = fitter_alt.fit_quantile_expanding(df_alt, "signal", lag = 0)
+
+    pass_ok = (
+        (fitter_alt.group_col == "signal_name") and (fitter_alt.date_col == "Date") and
+        ("signal_name" in df_params_alt.columns) and ("ticker" not in df_params_alt.columns) and
+        np.array_equal(df_params_alt.position.values, df_params.position.values) and
+        ("signal_name" in df_stats_alt.columns) and
+        np.allclose(df_stats_alt.test_sharpe.values, df_stats.test_sharpe.values) and
+        all(np.allclose(tts_date_alt[t]["edges"], tts_date[t]["edges"]) for t in tts_date) and
+        all(tts_date_alt[t]["test"].index.name == "Date" for t in tts_date_alt) and
+        all(np.array_equal(exp_alt[t].position.values, exp_dict[t].position.values) for t in exp_dict) and
+        (exp_alt[trend].index.name == "Date"))
+
+    results.append(_check("Custom group_col / date_col pass through, match defaults", pass_ok))
 
     n_total = sum(len(x) for x in exp_dict.values())
 
