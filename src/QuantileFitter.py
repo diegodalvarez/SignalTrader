@@ -479,6 +479,54 @@ class QuantileFitter(SignalFitter):
 
         return df_out
 
+    def get_quantile_data(self, fit_output: dict) -> pd.DataFrame:
+
+        '''
+        Stacks the output of any quantile fit into one long frame with a
+        sample column
+            fit_quantile_full_sample  -> its "data", sample = in_sample
+            fit_quantile_train_test_* -> every group's train and test, sample = train / test
+            fit_quantile_expanding    -> every group's frame, sample = expanding
+
+        Returns <date_col> | <group_col> | sample | ... sorted by group, date
+        '''
+
+        if len(fit_output) == 0:
+            raise ValueError("fit_output is empty, every group may have been skipped")
+
+        if ("data" in fit_output) and ("config" in fit_output):
+            df_out = fit_output["data"].assign(sample = "in_sample")
+
+        else:
+
+            df_lists = []
+            for group, fit_tmp in fit_output.items():
+
+                if isinstance(fit_tmp, pd.DataFrame):
+                    samples = {"expanding": fit_tmp}
+
+                else:
+                    samples = {"train": fit_tmp["train"], "test": fit_tmp["test"]}
+
+                for sample, df_tmp in samples.items():
+
+                    df_add = (df_tmp
+                        .rename_axis(self.date_col)
+                        .reset_index()
+                        .assign(**{self.group_col: group, "sample": sample}))
+
+                    df_lists.append(df_add)
+
+            df_out = pd.concat(df_lists)
+
+        first_cols = [self.date_col, self.group_col, "sample"]
+        df_out     = (df_out
+            [first_cols + [col for col in df_out.columns if col not in first_cols]]
+            .sort_values([self.group_col, self.date_col])
+            .reset_index(drop = True))
+
+        return df_out
+
     def _expanding_bin_sharpe(
             self,
             y      : np.ndarray,
@@ -750,6 +798,50 @@ def main() -> None:
         (exp_alt[trend].index.name == "Date"))
 
     results.append(_check("Custom group_col / date_col pass through, match defaults", pass_ok))
+
+    # 10. get_quantile_data stacks train / test, expanding and full sample
+    df_tts_data = fitter.get_quantile_data(tts_ratio)
+    df_bounds   = (df_tts_data
+        .groupby(["ticker", "sample"])
+        .date
+        .agg(["min", "max"])
+        .unstack())
+
+    results.append(_check("Stack train/test: every train and test row, labelled",
+        (len(df_tts_data) == sum(len(t["train"]) + len(t["test"]) for t in tts_ratio.values())) and
+        (set(df_tts_data["sample"]) == {"train", "test"}) and
+        (set(df_tts_data.ticker) == set(tts_ratio.keys()))))
+    results.append(_check("Stack train/test: train before test, no duplicate dates",
+        (df_bounds[("max", "train")] < df_bounds[("min", "test")]).all() and
+        (not df_tts_data.duplicated(["ticker", "date"]).any())))
+    results.append(_check("Stack train/test: position, signal_rtn match the fit", all(
+        np.allclose(
+            df_tts_data.loc[lambda x: (x.ticker == t) & (x["sample"] == name)].signal_rtn.values,
+            tts_ratio[t][name].signal_rtn.values) and
+        np.array_equal(
+            df_tts_data.loc[lambda x: (x.ticker == t) & (x["sample"] == name)].position.values,
+            tts_ratio[t][name].position.values)
+        for t in tts_ratio.keys() for name in ["train", "test"])))
+
+    df_exp_data  = fitter.get_quantile_data(exp_dict)
+    df_full_data = fitter.get_quantile_data(fit_dict)
+
+    results.append(_check("Stack expanding: every row, sample = expanding, matches",
+        (len(df_exp_data) == sum(len(x) for x in exp_dict.values())) and
+        (set(df_exp_data["sample"]) == {"expanding"}) and
+        np.array_equal(df_exp_data.loc[lambda x: x.ticker == trend].position.values, exp_dict[trend].position.values)))
+    results.append(_check("Stack full sample: its data with sample = in_sample",
+        (len(df_full_data) == len(fit_dict["data"])) and (set(df_full_data["sample"]) == {"in_sample"})))
+
+    df_alt_data = fitter_alt.get_quantile_data(tts_date_alt)
+    raised      = False
+    try:
+        fitter.get_quantile_data({})
+    except ValueError:
+        raised = True
+
+    results.append(_check("Stack: custom date / group cols first, empty input raises",
+        (list(df_alt_data.columns[:3]) == ["Date", "signal_name", "sample"]) and raised))
 
     n_total = sum(len(x) for x in exp_dict.values())
 

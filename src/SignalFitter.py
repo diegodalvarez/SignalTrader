@@ -607,7 +607,9 @@ class SignalFitter:
                 for group, df_tmp in fit_result.items()])
                 .reset_index())
 
-            return df_out[[self.date_col, self.group_col] + [col for col in df_out.columns if col not in [self.date_col, self.group_col]]]
+            return (df_out[
+                [self.date_col, self.group_col] + 
+                [col for col in df_out.columns if col not in [self.date_col, self.group_col]]])
 
         df_out = (pd.concat([
             self._get_model_params(model).assign(**{self.group_col: group})
